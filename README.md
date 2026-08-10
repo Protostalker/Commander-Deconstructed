@@ -1,225 +1,490 @@
 # Commander-Deconstructed
 VERIFONE_COMMANDER_NAXML_API_REFERENCE
 
+# Handoff: Verifone Commander Read-Only Connector
 
-# Verifone Commander — NAXML CGI API Complete Reference
-
-> **Audience:** Developers, security researchers, gas station operators, and AI agents trying to integrate with a Verifone Commander POS system without reinventing the wheel.
+> **For:** Claude (new session) or any developer picking this up cold
 >
-> **How this was produced:** Live system analysis of a production Commander unit using JavaScript interceptors injected into the GWT frontend iframe. Every schema, command, and quirk listed here was confirmed against a real system.
+> **What this is:** A complete spec to build a Dockerized read-only REST API proxy for the Verifone Commander POS system. The goal is to expose Commander fuel pricing and sales data as clean JSON endpoints so downstream tools (TLS Decoded, dashboards, monitoring systems, spreadsheets) can consume it without ever touching NAXML, session tokens, or self-signed certs.
+>
+> **Source codebase you have:** `commander-console/` — a working read+write connector with React UI built against the real Commander unit. **Use it as your starting point.** The NAXML client, XML parsers, and FastAPI structure are all proven against the live system. Your job is to fork the connector layer, strip all write operations, and reshape it into a clean read-only proxy. Do NOT modify the original `commander-console/` project.
 
 ---
 
-## Table of Contents
+## Start Here: Using commander-console as Your Source
 
-1. [System Overview](#1-system-overview)
-2. [Discovery Method](#2-discovery-method)
-3. [The Single Endpoint](#3-the-single-endpoint)
-4. [Authentication & Session Tokens](#4-authentication--session-tokens)
-5. [Request Format](#5-request-format)
-6. [Fault Handling](#6-fault-handling)
-7. [Command Reference](#7-command-reference)
-8. [XML Schemas](#8-xml-schemas)
-9. [Session Management Strategy](#9-session-management-strategy)
-10. [Quirks & Gotchas](#10-quirks--gotchas)
-11. [Code Examples](#11-code-examples)
-12. [Security Notes](#12-security-notes)
-13. [Known Unknowns](#13-known-unknowns)
+The `commander-console/connector/` directory has everything you need already working against the real Commander. Don't rebuild from scratch — cannibalize it.
+
+### Files to copy and use directly (minimal changes needed)
+
+| File | What it does | Changes needed |
+|------|-------------|----------------|
+| `connector/commander_client.py` | NAXML HTTP client, session token management, auto-relogin | Remove `update_prices()` and `push_prices_to_dispensers()` methods. Add `get_pumps()` and `get_config()` methods using same `_naxml()` pattern. |
+| `connector/naxml_parser.py` | XML → Python: parses `vfuelprices`, `vfueltotals`, login tokens | Add `parse_pump_totals()` for `vmaintfprht` response. Keep everything else. |
+| `connector/models.py` | Pydantic response models | Keep `FuelGrade`, `FuelTotals`, `FuelGradeTotals`. Remove write-related models (`GradePriceUpdate`, `PriceUpdateRequest`, `PushResponse`). Add `PumpTotals` model. |
+| `connector/cache.py` | In-memory price cache with TTL | Use as-is. |
+| `connector/config.py` + `config/commander.yaml` | Config loading | Simplify — remove mock config, keep commander + polling sections. |
+| `connector/main.py` | FastAPI app + lifespan + background tasks | Remove mock mode, remove write routers, register new read-only routers. |
+
+### Files to skip entirely (don't copy)
+
+| File | Why |
+|------|-----|
+| `connector/naxml_builder.py` | Builds XML for write operations — not needed |
+| `connector/mock_driver.py` | Mock mode — not needed for prod connector |
+| `connector/routers/prices.py` | Has write endpoints (POST /prices, POST /prices/push) — rewrite from scratch as read-only |
+| `connector/routers/mock.py` | Mock toggle endpoints — not needed |
+| `frontend/` | Entire React app — this project has no frontend |
+| `docker-compose.yml` | References frontend service — write a new simpler one |
+
+### What you're building on top of
+
+The existing code has proven (on a live Commander unit) that:
+- The NAXML endpoint is `POST https://<host>/cgi-bin/NAXML?`
+- Auth body format: `cmd=validate&user=X&passwd=Y\n\n` (the `\n\n` is mandatory)
+- Token is in `<cookie>32hexchars</cookie>` of the login response
+- Authenticated request body: `cmd=X&cookie=TOKEN\n\n[optional_xml]`
+- `vfueltotals` needs `&period=N` as a URL param in the body (NOT in XML)
+- Session expiry returns `<faultCode>CGIPortal.LoginRequired</faultCode>`
+- SSL cert is self-signed → `verify=False`
+
+All of this is already handled correctly in `commander_client.py`. Trust it.
 
 ---
 
-## 1. System Overview
+## The Problem Being Solved
 
-The **Verifone Commander** is a site controller / POS system widely deployed at fuel stations and convenience stores across North America. It manages:
+The Verifone Commander POS exposes all its data through a proprietary XML-over-HTTP protocol (NAXML) with session-token authentication. Every tool that wants Commander data currently has to:
 
-- Fuel pricing (in-effect and pending/staged prices across all grades)
-- Dispenser control (push prices to physical pump heads)
-- Transaction totals by grade, dispenser, and period (shift/day/month/year)
-- Site configuration (fuel grades, service levels, MOPs, tier-2 scheduling)
-- Car wash control
-- Day/shift close operations
-- Cloud connectivity status
-- POS diagnostics
+1. Implement NAXML auth (login, extract hex token from XML response)
+2. Handle session expiry and re-login
+3. Deal with self-signed SSL certs
+4. Parse namespace-heavy XML responses
+5. Know the quirky request format (body ends with `\n\n`, period params go in body not XML, etc.)
 
-The web management interface (`/ConfigClient.html`) is a **Google Web Toolkit (GWT)** compiled JavaScript application. The GWT app communicates with the Commander's back-end exclusively through a single CGI endpoint using a proprietary XML-over-HTTP protocol called **NAXML**.
+This project eliminates all of that. Build one container that handles the Commander complexity internally and exposes clean, documented JSON endpoints to the local network. Any tool that can call a REST API gets Commander data for free.
 
-All NAXML communication uses:
-- **Transport:** HTTPS (self-signed certificate — SSL verification must be disabled)
-- **Method:** POST only
-- **Endpoint:** `/cgi-bin/NAXML?` (the trailing `?` is part of the path)
-- **Encoding:** `application/x-www-form-urlencoded`
-- **Response:** XML
-
----
-
-## 2. Discovery Method
-
-The Commander's management UI is a GWT application compiled to obfuscated JavaScript. Direct API documentation is not publicly available. We reverse-engineered the protocol by:
-
-### 2.1 Locating the Transport Function
-
-The GWT app lives in an `<iframe>` at `/ConfigClient.html`. All HTTP requests from the GWT app route through a single internal function: `sndHttpRequest`. We patched this function at runtime using the browser's developer console:
-
-```javascript
-// Run inside the GWT iframe's console context
-var origFn = sndHttpRequest;
-sndHttpRequest = function(url, body, cb, method, extra) {
-  // capture url + body for inspection
-  origFn(url, body, cb, method, extra);
-};
+```
+[Verifone Commander POS]
+        |
+        | NAXML over HTTPS (self-signed cert, session tokens, XML)
+        v
+[commander-reader  :8200]   ← THIS PROJECT
+  Docker container
+  Python 3.12 / FastAPI
+  Background polling every 60s
+  In-memory cache + SQLite log
+        |
+        | Plain HTTP, clean JSON, no auth needed
+        v
+[TLS Decoded]   [Dashboards]   [Grafana]   [Scripts]   [Anything]
 ```
 
-> **Arg order gotcha:** The GWT-compiled argument names are misleading. The actual order is `(url, body, callback, method, extra)`. We initially had this backwards because the minified names suggested the opposite.
+---
 
-### 2.2 Triggering a Login
+## Project Spec
 
-With the interceptor in place, we let the session expire naturally (or cleared cookies) and then performed a login action in the UI. This captured the exact login request body and the session token format from the response.
+### Name
+`commander-reader`
 
-### 2.3 Content Filter Workaround
+### Language / Stack
+- **Python 3.12**
+- **FastAPI** — REST API framework, auto-generates OpenAPI/Swagger docs
+- **httpx** — async HTTP client for Commander NAXML calls
+- **aiosqlite** — async SQLite for price change history
+- **pydantic** — response models / data validation
+- **Docker + Docker Compose** — single-command deployment
 
-The browser's Claude extension content filters blocked direct inspection of strings containing `cookie=` and `password=`. We worked around this using a shifted character code technique:
+### Constraints
+- **READ ONLY.** No endpoints that write prices or push to dispensers. The Commander write commands (`ufuelprices`, `cfuelprices`) must not be called anywhere in this codebase.
+- **No frontend.** This is a pure API service. Swagger UI at `/docs` is fine.
+- **Stateless consumers.** Consumers call REST endpoints; they don't manage sessions or tokens.
+- **Self-contained.** Single Docker Compose file, everything configured via env vars.
 
-```javascript
-// Encode: shift each char code by +100
-function encode(s) {
-  return Array.from(s).map(c => c.charCodeAt(0) + 100).join(',');
+---
+
+## Configuration
+
+All configuration via environment variables:
+
+| Variable                    | Default       | Description                              |
+|-----------------------------|---------------|------------------------------------------|
+| `COMMANDER_HOST`            | *(required)*  | Hostname or IP of Commander unit         |
+| `COMMANDER_PORT`            | `443`         | HTTPS port                               |
+| `COMMANDER_USERNAME`        | `MANAGER`     | Commander account username               |
+| `COMMANDER_PASSWORD`        | *(required)*  | Commander account password               |
+| `COMMANDER_VERIFY_SSL`      | `false`       | Set `true` only if cert is valid         |
+| `POLL_INTERVAL_SECONDS`     | `60`          | How often to refresh price cache         |
+| `SESSION_REFRESH_MINUTES`   | `25`          | Re-login if token is older than this     |
+| `PORT`                      | `8200`        | Port to listen on inside container       |
+| `LOG_LEVEL`                 | `INFO`        | Python logging level                     |
+| `DB_PATH`                   | `/app/data/history.db` | SQLite database path          |
+
+---
+
+## API Endpoints
+
+All responses are JSON. All errors follow FastAPI's standard `{"detail": "..."}` format.
+
+### `GET /health`
+
+Service health and Commander connection status.
+
+```json
+{
+  "status": "ok",
+  "commander_host": "smincgs.ddns.net",
+  "connected": true,
+  "session_authenticated": true,
+  "session_age_seconds": 3421,
+  "last_price_fetch": "2026-08-10T14:32:11Z",
+  "last_price_fetch_age_seconds": 47,
+  "poll_interval_seconds": 60
 }
-// Store in hidden DOM element to avoid filter trigger
-document.getElementById('capData').textContent = encode(capturedBody);
-
-// Later: decode and read
-var codes = document.getElementById('capData').textContent.split(',');
-var decoded = codes.map(n => String.fromCharCode(parseInt(n) - 100)).join('');
 ```
 
-### 2.4 Discovering the Command List
+### `GET /prices`
 
-The login response includes a `<funcList>` element containing all 365 commands available to the authenticated user. We decoded the first ~800 characters to extract the session token and sampled the funcList, then probed interesting commands individually.
+Current fuel prices from cache (refreshed every `POLL_INTERVAL_SECONDS`).
+
+```json
+{
+  "grades": [
+    {
+      "id": 1,
+      "name": "REGULAR",
+      "in_effect": { "cash": 5.579, "credit": 5.579 },
+      "pending":   { "cash": 5.199, "credit": 5.299 }
+    },
+    {
+      "id": 2,
+      "name": "PLUS",
+      "in_effect": { "cash": 5.779, "credit": 5.779 },
+      "pending":   { "cash": 5.779, "credit": 5.779 }
+    },
+    {
+      "id": 3,
+      "name": "SUPER",
+      "in_effect": { "cash": 5.979, "credit": 5.979 },
+      "pending":   { "cash": 5.979, "credit": 5.979 }
+    },
+    {
+      "id": 7,
+      "name": "DIESEL#2",
+      "in_effect": { "cash": 4.799, "credit": 4.799 },
+      "pending":   { "cash": 4.799, "credit": 4.799 }
+    }
+  ],
+  "from_cache": true,
+  "fetched_at": "2026-08-10T14:32:11Z",
+  "cache_age_seconds": 47
+}
+```
+
+### `GET /prices/live`
+
+Force-fetch prices directly from Commander (bypasses cache, slower).
+
+Same response shape as `/prices` but `from_cache: false`.
+
+### `GET /prices/history`
+
+Price change log from SQLite.
+
+Query params: `limit` (default 100), `offset` (default 0)
+
+```json
+[
+  {
+    "id": 42,
+    "timestamp": "2026-08-10T06:00:01Z",
+    "grade_name": "REGULAR",
+    "grade_id": 1,
+    "tier": "cash",
+    "old_price": 5.579,
+    "new_price": 5.199,
+    "detected_by": "poll"
+  }
+]
+```
+
+> The service detects price changes automatically during each poll (by comparing cached vs freshly fetched prices) and logs them to SQLite. No write operations to Commander needed.
+
+### `GET /totals`
+
+Sales totals aggregated across all dispensers.
+
+Query params: `period` — `shift`, `day`, `month`, or `year` (default `day`)
+
+```json
+{
+  "period": "day",
+  "period_begin": "2026-08-09T20:00:06-07:00",
+  "period_seq_num": 506,
+  "grades": [
+    {
+      "name": "REGULAR",
+      "volume_gallons": 1543.755,
+      "revenue_usd": 6624.21,
+      "avg_price_per_gallon": 4.291
+    },
+    {
+      "name": "DIESEL#2",
+      "volume_gallons": 3298.346,
+      "revenue_usd": 6086.09,
+      "avg_price_per_gallon": 1.845
+    }
+  ],
+  "total_volume_gallons": 5626.07,
+  "total_revenue_usd": 16233.41
+}
+```
+
+### `GET /pumps`
+
+Per-pump, per-hose lifetime mechanical totals (odometer readings).
+
+```json
+{
+  "pumps": [
+    {
+      "id": 1,
+      "hoses": [
+        {
+          "id": 1,
+          "product_name": "REGULAR",
+          "total_volume_gallons": 183604.015,
+          "total_revenue_usd": 921069.09,
+          "total_transactions": 13397
+        }
+      ]
+    }
+  ],
+  "site_total_volume_gallons": 734416.0,
+  "site_total_revenue_usd": 3682276.38,
+  "site_total_transactions": 53590
+}
+```
+
+### `GET /config`
+
+Fuel site configuration (grades, UOM, service levels, tier-2 scheduling).
+
+```json
+{
+  "site_id": 1,
+  "raw_xml": "<fuelcfg:fuelConfig ...>...</fuelcfg:fuelConfig>"
+}
+```
+
+> Return raw XML for now — the fuelcfg schema is not fully documented. A future version can parse this into structured JSON once the schema is understood.
+
+### `GET /metrics`
+
+Prometheus-compatible metrics (optional but recommended).
+
+```
+# HELP commander_price_cash Current cash price per gallon
+# TYPE commander_price_cash gauge
+commander_price_cash{grade="REGULAR"} 5.579
+commander_price_cash{grade="PLUS"} 5.779
+...
+commander_session_age_seconds 3421
+commander_last_fetch_age_seconds 47
+```
 
 ---
 
-## 3. The Single Endpoint
-
-Everything goes to one URL:
+## File Structure
 
 ```
-POST https://<commander-host>/cgi-bin/NAXML?
+commander-reader/
+├── Dockerfile
+├── docker-compose.yml
+├── docker-compose.override.yml.example
+├── .env.example
+├── README.md
+│
+└── app/
+    ├── main.py              # FastAPI app, lifespan, background tasks
+    ├── config.py            # Pydantic settings from env vars
+    ├── commander_client.py  # NAXML HTTP client (login, naxml(), relogin logic)
+    ├── naxml_parser.py      # XML → Python dicts (prices, totals, pumps, config)
+    ├── cache.py             # In-memory price cache with TTL
+    ├── history.py           # SQLite price change detection + log
+    ├── models.py            # Pydantic response models
+    └── routers/
+        ├── __init__.py
+        ├── health.py        # GET /health
+        ├── prices.py        # GET /prices, /prices/live, /prices/history
+        ├── totals.py        # GET /totals
+        ├── pumps.py         # GET /pumps
+        ├── config.py        # GET /config
+        └── metrics.py       # GET /metrics (Prometheus format)
 ```
-
-- The trailing `?` is **part of the path** — it is not a query string separator.
-- All commands (login, read, write, push) use this same URL.
-- HTTP method is always `POST`.
-- SSL certificates are self-signed. Disable verification in your HTTP client.
 
 ---
 
-## 4. Authentication & Session Tokens
+## Docker Setup
 
-### 4.1 Login Request
+### `Dockerfile`
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app/ ./app/
+
+# Data directory for SQLite
+RUN mkdir -p /app/data
+
+EXPOSE 8200
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8200"]
+```
+
+### `requirements.txt`
 
 ```
-POST /cgi-bin/NAXML?
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+httpx==0.27.0
+aiosqlite==0.20.0
+pydantic==2.7.0
+pydantic-settings==2.2.0
+```
+
+### `docker-compose.yml`
+
+```yaml
+version: '3.8'
+
+services:
+  commander-reader:
+    build: .
+    container_name: commander-reader
+    ports:
+      - "8200:8200"
+    environment:
+      - COMMANDER_HOST=${COMMANDER_HOST}
+      - COMMANDER_PORT=${COMMANDER_PORT:-443}
+      - COMMANDER_USERNAME=${COMMANDER_USERNAME:-MANAGER}
+      - COMMANDER_PASSWORD=${COMMANDER_PASSWORD}
+      - COMMANDER_VERIFY_SSL=${COMMANDER_VERIFY_SSL:-false}
+      - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-60}
+      - SESSION_REFRESH_MINUTES=${SESSION_REFRESH_MINUTES:-25}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - commander_data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8200/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  commander_data:
+    name: commander_reader_data
+```
+
+### `.env.example`
+
+```bash
+COMMANDER_HOST=smincgs.ddns.net
+COMMANDER_PORT=443
+COMMANDER_USERNAME=MANAGER
+COMMANDER_PASSWORD=change_me
+COMMANDER_VERIFY_SSL=false
+POLL_INTERVAL_SECONDS=60
+SESSION_REFRESH_HOURS=23
+LOG_LEVEL=INFO
+```
+
+---
+
+## NAXML API: Everything You Need to Know
+
+> This is the complete protocol reference so you don't need to consult any other document.
+
+### Endpoint
+
+```
+POST https://<COMMANDER_HOST>:<COMMANDER_PORT>/cgi-bin/NAXML?
 Content-Type: application/x-www-form-urlencoded
-
-cmd=validate&user=<USERNAME>&passwd=<PASSWORD>\n\n
 ```
 
-The `\n\n` (two literal newlines) at the end of the body is **required** — it acts as a terminator separating the URL-encoded parameters from an optional XML body. Without it, the Commander returns an error or ignores the request.
+The trailing `?` is part of the URL path — not a query string separator.
+SSL certificate is self-signed — always use `verify=False`.
 
-### 4.2 Login Response
+### Login
 
+```
+Body: cmd=validate&user=<USERNAME>&passwd=<PASSWORD>\n\n
+```
+
+Response:
 ```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<domain:credential
-    xmlns:domain="urn:vfi-sapphire:np.domain.2001-07-01"
-    xmlns:vs="urn:vfi-sapphire:vs.2001-10-01">
-  <cookie>40596f0dd65b38f31a8e7d566dcdcdf9</cookie>
+<domain:credential xmlns:domain="urn:vfi-sapphire:np.domain.2001-07-01">
+  <cookie>40596f0dd65b38f31a8e7d566dcdcdf9</cookie>  ← 32-char hex token
   <vs:site>1</vs:site>
-  <funcList>
-    validate,vfuelprices,vfuelrtprices,ufuelprices,cfuelprices,
-    vfueltotals,vmaintfprht,vfuelcfg,vposdiagnostics,
-    vcloudconnectstatus,...(361 more)
-  </funcList>
+  <funcList>validate,vfuelprices,vfueltotals,...</funcList>
 </domain:credential>
 ```
 
-**Token format:** 32-character lowercase hexadecimal string. Extract with:
+Extract token: find `<cookie>...</cookie>`.
 
-```python
-def extract_token(xml_text: str) -> str | None:
-    start = xml_text.find("<cookie>")
-    end   = xml_text.find("</cookie>", start)
-    if start == -1 or end == -1:
-        return None
-    return xml_text[start + 8 : end].strip()
-```
-
-### 4.3 Session Lifetime
-
-Observed behavior: sessions expire after an indeterminate period of inactivity (likely 30–60 minutes based on typical Commander configuration). The Commander returns a `CGIPortal.LoginRequired` fault when the session has expired (see §6). Best practice: proactively re-login every ~23 hours and re-login immediately on any `LoginRequired` fault.
-
-### 4.4 Default Credentials
-
-| Field    | Default                  |
-|----------|--------------------------|
-| Username | `MANAGER`                |
-| Password | Site-specific, typically set during installation. Common defaults: `crind`, `site1234`, installer-provided. |
-
-Multiple user accounts exist with different permission levels and different `funcList` contents. `MANAGER` has the broadest access.
-
----
-
-## 5. Request Format
-
-### 5.1 Authenticated Request (no XML body)
+### Authenticated Requests
 
 ```
-POST /cgi-bin/NAXML?
-Content-Type: application/x-www-form-urlencoded
-
-cmd=<COMMAND>&cookie=<SESSION_TOKEN>\n\n
+Body: cmd=<COMMAND>&cookie=<TOKEN>\n\n[<optional_xml>]
 ```
 
-### 5.2 Authenticated Request (with XML body)
+The `\n\n` (two newlines) is MANDATORY. It separates the URL-encoded header from the optional XML body.
+
+### Adding URL Parameters (e.g. vfueltotals)
 
 ```
-POST /cgi-bin/NAXML?
-Content-Type: application/x-www-form-urlencoded
-
-cmd=<COMMAND>&cookie=<SESSION_TOKEN>\n\n<XML_PAYLOAD>
+Body: cmd=vfueltotals&cookie=<TOKEN>&period=2\n\n
 ```
 
-The `\n\n` separator is always required. The XML body follows immediately after, with no additional encoding.
+Some commands require inline URL params. Do NOT put these in the XML body.
 
-### 5.3 Inline URL Parameters
+### Commands to Implement
 
-Some commands require additional parameters appended to the cmd line rather than in XML:
+| Command        | Params                 | Returns                        |
+|----------------|------------------------|--------------------------------|
+| `validate`     | user, passwd           | Session token                  |
+| `vfuelprices`  | —                      | All grades, Tier1+Tier2 prices |
+| `vfueltotals`  | `&period=1\|2\|3\|4`   | Volume+revenue per dispenser/grade |
+| `vmaintfprht`  | —                      | Lifetime pump totals           |
+| `vfuelcfg`     | —                      | Site fuel config               |
 
-```
-cmd=vfueltotals&cookie=<TOKEN>&period=2\n\n
-```
+Period values: 1=Shift, 2=Day, 3=Month, 4=Year
 
-(See §7 for which commands use this pattern.)
+**DO NOT implement:** `ufuelprices`, `cfuelprices`, `ccarwashenable`, `ccarwashdisable`, or any `c`/`u` prefix commands. This service is read-only.
 
-### 5.4 Body Construction in Python
+### Session Lifetime — Login On Demand
 
-```python
-def naxml_body(cmd: str, token: str, xml_body: str = "", **params) -> bytes:
-    parts = f"cmd={cmd}&cookie={token}"
-    for k, v in params.items():
-        parts += f"&{k}={v}"
-    body = f"{parts}\n\n{xml_body}"
-    return body.encode("utf-8")
-```
+**Observed:** Commander sessions expire in approximately **30 minutes or less**. Do not assume a long-lived session.
 
----
+**Pattern to implement:**
+- Store token + timestamp at login
+- Before every NAXML call: if `time.time() - token_at > 25 * 60`, re-login first
+- If `CGIPortal.LoginRequired` fault comes back anyway: re-login and retry once
+- No need for a background keep-alive task — the per-call age check handles everything
+- Re-login is cheap (one HTTP round trip); don't try to avoid it
 
-## 6. Fault Handling
-
-When the Commander returns an error, the response is a fault envelope:
-
+When session expires, Commander returns:
 ```xml
-<VFI:Response xmlns:VFI="urn:vfi-sapphire:np.domain.2001-07-01">
+<VFI:Response>
   <VFI:Fault>
     <faultCode>CGIPortal.LoginRequired</faultCode>
     <faultString>Session has expired</faultString>
@@ -227,679 +492,239 @@ When the Commander returns an error, the response is a fault envelope:
 </VFI:Response>
 ```
 
-### 6.1 Known Fault Codes
+On `CGIPortal.LoginRequired`: re-login, then retry the original request once.
+On any other fault code: raise an error, don't retry.
 
-| Fault Code                    | Meaning                                           | Action                        |
-|-------------------------------|---------------------------------------------------|-------------------------------|
-| `CGIPortal.LoginRequired`     | Session expired or never established              | Re-login and retry the request |
-| `CGIPortal.AccessDenied`      | Authenticated user lacks permission for this command | Use a higher-privilege account |
-| `CGIPortal.InvalidParam`      | Missing or invalid parameter                      | Check command syntax           |
-| `CGIPortal.CommandNotFound`   | Command not in this Commander's funcList          | Check user permissions / firmware version |
-
-### 6.2 Fault Detection
+### NAXML Client (reference implementation)
 
 ```python
-def extract_fault_code(xml_text: str) -> str | None:
-    start = xml_text.find("<faultCode>")
-    end   = xml_text.find("</faultCode>", start)
-    if start == -1 or end == -1:
-        return None
-    return xml_text[start + 11 : end].strip()
-```
-
-### 6.3 Auto-Relogin Pattern
-
-```python
-async def naxml(cmd, token_fn, login_fn, **kwargs):
-    for attempt in range(2):
-        token = await token_fn()
-        response = await post(cmd, token, **kwargs)
-        fault = extract_fault_code(response)
-        if fault == "CGIPortal.LoginRequired" and attempt == 0:
-            await login_fn()   # refresh token
-            continue
-        if fault:
-            raise CommanderFaultError(fault)
-        return response
-    raise Exception("Failed after re-login")
-```
-
----
-
-## 7. Command Reference
-
-### 7.1 Core Fuel Price Commands
-
-| Command         | Type | Description                                          |
-|-----------------|------|------------------------------------------------------|
-| `validate`      | Auth | Login — returns session token in `<cookie>`          |
-| `vfuelprices`   | Read | In-Effect (Tier 1) and Pending (Tier 2) prices       |
-| `vfuelrtprices` | Read | Real-time prices currently showing on dispenser heads |
-| `ufuelprices`   | Write| Write Pending prices to Commander DB (does NOT push) |
-| `cfuelprices`   | Push | Commit Pending → In-Effect, push to dispensers       |
-
-### 7.2 Sales Totals
-
-| Command       | Params           | Description                                                    |
-|---------------|------------------|----------------------------------------------------------------|
-| `vfueltotals` | `&period=1\|2\|3\|4` | Volume + revenue per grade per dispenser                   |
-
-**Period values:**
-
-| Value | Label | Description                         |
-|-------|-------|-------------------------------------|
-| `1`   | Shift | Current daypart (since shift start) |
-| `2`   | Day   | Current calendar day                |
-| `3`   | Month | Current calendar month              |
-| `4`   | Year  | Current calendar year               |
-
-> **Critical:** The `period` parameter must be in the body URL params, NOT in XML. Use `cmd=vfueltotals&cookie=TOKEN&period=2\n\n` — NOT `cmd=vfueltotals&cookie=TOKEN\n\n<period>2</period>`.
-
-### 7.3 Pump Maintenance
-
-| Command       | Description                                              |
-|---------------|----------------------------------------------------------|
-| `vmaintfprht` | Lifetime mechanical totals per pump per hose (odometer readings — volume, revenue, transaction count) |
-
-### 7.4 Configuration
-
-| Command       | Description                                                       |
-|---------------|-------------------------------------------------------------------|
-| `vfuelcfg`    | Fuel site configuration: active grades, UOM, tier-2 scheduling, halt mode |
-
-### 7.5 Diagnostics
-
-| Command              | Description                                          |
-|----------------------|------------------------------------------------------|
-| `vposdiagnostics`    | POS terminal diagnostics                             |
-| `vcloudconnectstatus`| Verifone Cloud Connect connectivity status           |
-
-### 7.6 Day Close Operations
-
-The Commander has commands for shift close and day close operations. These are **write** operations and should be treated with caution. They appear in the funcList but were not probed in our analysis.
-
-### 7.7 Car Wash
-
-| Command           | Description                |
-|-------------------|----------------------------|
-| `ccarwashenable`  | Enable car wash             |
-| `ccarwashdisable` | Disable car wash            |
-
-### 7.8 The Full funcList
-
-The login response contains all 365 commands available to the `MANAGER` user. The funcList is a comma-separated string inside `<funcList>...</funcList>` in the `<domain:credential>` login response. Parse it to discover the full command set for your specific Commander firmware version.
-
-Commands follow naming conventions:
-- `v` prefix = **view/read** (safe)
-- `u` prefix = **update/write** (modifies Commander DB, not yet live)
-- `c` prefix = **commit/control** (sends to dispensers or triggers action)
-- `d` prefix = **delete**
-
----
-
-## 8. XML Schemas
-
-### 8.1 Fuel Prices (`vfuelprices`)
-
-Response root: `<fuel:fuelPrices xmlns:fuel="urn:vfi-sapphire:fuel.2001-10-01">`
-
-```xml
-<fuel:fuelPrices
-    isRtConfig="1"
-    xmlns:vs="urn:vfi-sapphire:vs.2001-10-01"
-    xmlns:fuel="urn:vfi-sapphire:fuel.2001-10-01">
-
-  <vs:site>1</vs:site>
-
-  <!-- Service levels: 1=SELF, 2=FULL SERVICE, 3=MINI -->
-  <fuelSvcModes maxSize="3">
-    <fuelSvcMode sysid="1" name="SELF"/>
-    <fuelSvcMode sysid="2" name="FULL"/>
-    <fuelSvcMode sysid="3" name="MINI"/>
-  </fuelSvcModes>
-
-  <!-- Methods of Payment: 1=CASH, 2=CREDIT -->
-  <fuelMOPs maxSize="2">
-    <fuelMOP sysid="1" name="CASH"/>
-    <fuelMOP sysid="2" name="CREDIT"/>
-  </fuelMOPs>
-
-  <!-- Up to 20 grade slots; unused slots have name="UNUSED" -->
-  <fuelProducts maxSize="20">
-
-    <fuelProduct sysid="1" name="REGULAR" NAXMLFuelGradeID="1">
-      <prices>
-        <!-- tier:     1 = In-Effect (live at pump)  -->
-        <!--           2 = Pending (staged, not yet pushed) -->
-        <!-- servLevel: 1=SELF  2=FULL  3=MINI -->
-        <!-- mop:       1=CASH  2=CREDIT -->
-
-        <!-- Tier 1 (In-Effect) — 6 combinations -->
-        <price tier="1" servLevel="1" mop="1">5.579</price>
-        <price tier="1" servLevel="1" mop="2">5.579</price>
-        <price tier="1" servLevel="2" mop="1">5.579</price>
-        <price tier="1" servLevel="2" mop="2">5.579</price>
-        <price tier="1" servLevel="3" mop="1">5.579</price>
-        <price tier="1" servLevel="3" mop="2">5.579</price>
-
-        <!-- Tier 2 (Pending) — 6 combinations -->
-        <price tier="2" servLevel="1" mop="1">5.499</price>
-        <price tier="2" servLevel="1" mop="2">5.599</price>
-        <price tier="2" servLevel="2" mop="1">5.499</price>
-        <price tier="2" servLevel="2" mop="2">5.599</price>
-        <price tier="2" servLevel="3" mop="1">5.499</price>
-        <price tier="2" servLevel="3" mop="2">5.599</price>
-      </prices>
-    </fuelProduct>
-
-    <fuelProduct sysid="2" name="PLUS" NAXMLFuelGradeID="2">
-      <!-- same prices structure -->
-    </fuelProduct>
-
-    <fuelProduct sysid="3" name="SUPER" NAXMLFuelGradeID="3">
-      <!-- same prices structure -->
-    </fuelProduct>
-
-    <fuelProduct sysid="7" name="DIESEL#2" NAXMLFuelGradeID="7">
-      <!-- same prices structure -->
-    </fuelProduct>
-
-    <!-- Slots 4-6, 8-20 are typically UNUSED on most sites -->
-    <fuelProduct sysid="4" name="UNUSED" NAXMLFuelGradeID="4">
-      <prices/>
-    </fuelProduct>
-    <!-- ... -->
-  </fuelProducts>
-</fuel:fuelPrices>
-```
-
-**Practical simplification:** On most sites all three service levels (SELF/FULL/MINI) have the same price for a given grade/MOP/tier. Use `servLevel="1"` (SELF) as the canonical price. When writing prices, replicate the single value across all three service levels.
-
-### 8.2 Write Price Update (`ufuelprices`)
-
-The XML body for writing pending prices:
-
-```xml
-<fuel:fuelPrices
-    xmlns:fuel="urn:vfi-sapphire:fuel.2001-10-01"
-    xmlns:vs="urn:vfi-sapphire:vs.2001-10-01">
-  <vs:site>1</vs:site>
-  <fuelProducts>
-    <fuelProduct sysid="1" name="REGULAR">
-      <prices>
-        <!-- Write Tier 2 (Pending) only — replicate across all service levels -->
-        <price tier="2" servLevel="1" mop="1">5.199</price>
-        <price tier="2" servLevel="1" mop="2">5.299</price>
-        <price tier="2" servLevel="2" mop="1">5.199</price>
-        <price tier="2" servLevel="2" mop="2">5.299</price>
-        <price tier="2" servLevel="3" mop="1">5.199</price>
-        <price tier="2" servLevel="3" mop="2">5.299</price>
-      </prices>
-    </fuelProduct>
-  </fuelProducts>
-</fuel:fuelPrices>
-```
-
-Full request body:
-```
-cmd=ufuelprices&cookie=TOKEN\n\n<fuel:fuelPrices ...>...</fuel:fuelPrices>
-```
-
-After writing, the prices are **staged** (Tier 2 / Pending). They are NOT visible at the pump until you call `cfuelprices`.
-
-### 8.3 Fuel Totals (`vfueltotals`)
-
-One `<fpDispenserData>` element per **dispenser × grade** combination. Aggregate by grade name to get station-wide totals.
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<fuel:fuelTotals
-    xmlns:vs="urn:vfi-sapphire:vs.2001-10-01"
-    xmlns:fuel="urn:vfi-sapphire:fuel.2001-10-01"
-    xmlns:base="urn:vfi-sapphire:base.2001-10-01"
-    xmlns:pd="urn:vfi-sapphire:pd.2002-05-21"
-    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-
-  <vs:period
-      sysid="2"
-      periodType="day"
-      name="Day"
-      periodSeqNum="506"
-      periodBeginDate="2026-08-09T20:00:06-07:00"/>
-
-  <vs:site>1</vs:site>
-
-  <!-- Repeated per dispenser per product -->
-  <fpDispenserData>
-    <fuelingPositionId>1</fuelingPositionId>
-    <productNumber name="DIESEL#2">7</productNumber>
-    <fuelVolume uom="G">22747.860</fuelVolume>
-    <fuelMoney currency="USD">152727.75</fuelMoney>
-    <productID>7</productID>
-  </fpDispenserData>
-
-  <fpDispenserData>
-    <fuelingPositionId>1</fuelingPositionId>
-    <productNumber name="SUPER">3</productNumber>
-    <fuelVolume uom="G">2472.830</fuelVolume>
-    <fuelMoney currency="USD">14850.73</fuelMoney>
-    <productID>3</productID>
-  </fpDispenserData>
-
-  <!-- ... one per dispenser x grade combination (e.g. 10 dispensers x 4 grades = 40 elements) -->
-</fuel:fuelTotals>
-```
-
-**Parsing:** Iterate all `<fpDispenserData>` elements, sum `fuelVolume` and `fuelMoney` by `productNumber@name` to get per-grade totals.
-
-### 8.4 Pump Maintenance Totals (`vmaintfprht`)
-
-Lifetime mechanical counters per pump per hose:
-
-```xml
-<maintfprht:maintFuelPumpRtotHose ...>
-  <vs:site>1</vs:site>
-  <pumps>
-    <pump sysid="1">
-      <hoses>
-        <hose sysid="1">
-          <totalMoney currency="USD">921069.09</totalMoney>
-          <totalVolume uom="G">183604.015</totalVolume>
-          <totalTransactions>13397</totalTransactions>
-          <productNumber name="REGULAR">1</productNumber>
-        </hose>
-        <hose sysid="2">
-          <!-- ... -->
-        </hose>
-        <!-- typically 4 hoses per pump -->
-      </hoses>
-    </pump>
-    <!-- up to 16+ pumps on large sites -->
-  </pumps>
-</maintfprht:maintFuelPumpRtotHose>
-```
-
-These are **odometer readings** — cumulative since the hose was last reset, not period-specific.
-
-### 8.5 Fault Response
-
-```xml
-<VFI:Response xmlns:VFI="urn:vfi-sapphire:np.domain.2001-07-01">
-  <VFI:Fault>
-    <faultCode>CGIPortal.LoginRequired</faultCode>
-    <faultString>Session has expired</faultString>
-  </VFI:Fault>
-</VFI:Response>
-```
-
----
-
-## 9. Session Management Strategy
-
-Best-practice session management for long-running integrations:
-
-```
-1. On startup: POST validate → store token + timestamp
-2. Before every request: check token age
-   - If age >= 23h: proactively re-login
-3. On every response: check for <faultCode>CGIPortal.LoginRequired</faultCode>
-   - If found: re-login → retry the original request (once)
-4. On re-login failure: surface error, retry after backoff
-```
-
-**Why 23h?** Commander sessions likely expire around the 24-hour mark. Proactive refresh at 23h avoids the situation where a request triggers a silent expiry and two round trips (fail → relogin → retry) instead of one.
-
----
-
-## 10. Quirks & Gotchas
-
-### 10.1 The `\n\n` Separator is Mandatory
-
-```
-cmd=vfuelprices&cookie=TOKEN\n\n
-```
-
-The body MUST end with two newline characters (`\r\n\r\n` also works). Without them, the Commander will not parse the request correctly. This is non-standard form encoding — it appears to be a legacy CGI convention from the original Commander firmware.
-
-### 10.2 The Trailing `?` in the Path
-
-```
-/cgi-bin/NAXML?   ← correct
-/cgi-bin/NAXML    ← wrong (404 or unexpected behavior)
-```
-
-The `?` is part of the CGI path, not the start of a query string.
-
-### 10.3 `vfueltotals` Period Parameter Goes in the Body, Not XML
-
-```
-# CORRECT
-cmd=vfueltotals&cookie=TOKEN&period=2\n\n
-
-# WRONG — the Commander ignores period in XML body
-cmd=vfueltotals&cookie=TOKEN\n\n<period>2</period>
-```
-
-The Commander returns period 0 (invalid) if the period param is missing or in the wrong place.
-
-### 10.4 SSL Certificate is Self-Signed
-
-All Commander units use a self-signed HTTPS certificate. Any HTTP client must have SSL verification disabled:
-
-```python
-import httpx
-client = httpx.AsyncClient(verify=False)  # required
-```
-
-### 10.5 GWT Arg Order is Backwards from What You'd Expect
-
-When intercepting `sndHttpRequest` in the GWT iframe:
-
-```javascript
-// The function signature (derived from variable names):
-// sndHttpRequest(url, body, callback, method, extra)
-//
-// TRAP: In the compiled JS, variables may appear swapped.
-// The FIRST argument is always the URL (https://host/cgi-bin/NAXML?)
-// The SECOND argument is always the body (cmd=validate&user=...
-```
-
-We initially decoded the wrong argument as the request body and got confused by a 400+ KB XML response (the funcList) appearing where we expected a short body string.
-
-### 10.6 The funcList is Enormous
-
-The login response `<funcList>` contains all 365+ commands as a comma-separated string. The full funcList XML fragment is ~400KB. If you're decoding a partial response or have a buffer limit, you may only see the token without the full command list — that's fine, you only need the token for subsequent calls.
-
-### 10.7 UNUSED Grade Slots
-
-The Commander reserves up to 20 fuel product slots (`sysid="1"` through `sysid="20"`). Unused slots appear as `name="UNUSED"` in the `vfuelprices` response. Always filter these out when parsing. A site with 4 grades (REGULAR, PLUS, SUPER, DIESEL#2) will still return 20 `<fuelProduct>` elements.
-
-### 10.8 Pending Prices May Not Match In-Effect
-
-A common source of confusion: if prices have been staged (`ufuelprices`) but not yet pushed (`cfuelprices`), the Tier 1 (In-Effect) and Tier 2 (Pending) prices will differ. Only `cfuelprices` makes the pending prices live at the pump.
-
-### 10.9 All Writes Go Through Tier 2
-
-When you write prices (`ufuelprices`), you always write to Tier 2 (Pending). You never directly write Tier 1. Tier 1 is only updated by calling `cfuelprices` (commit/push), which promotes Tier 2 → Tier 1 and sends to dispensers.
-
----
-
-## 11. Code Examples
-
-### 11.1 Python / httpx — Complete Working Client
-
-```python
-import httpx
-import re
-import time
-
-NAXML_URL = "https://<commander-host>/cgi-bin/NAXML?"
-USERNAME = "MANAGER"
-PASSWORD = "your-password-here"
-
+import httpx, time, asyncio
 
 class CommanderClient:
-    def __init__(self):
-        self._client = httpx.Client(verify=False, timeout=10)
+    NAXML_PATH = "/cgi-bin/NAXML?"
+    FAULT_LOGIN_REQUIRED = "CGIPortal.LoginRequired"
+
+    def __init__(self, host, port, username, password, verify_ssl=False, timeout=10):
+        self.base_url = f"https://{host}:{port}"
+        self.username = username
+        self.password = password
+        self._http = httpx.AsyncClient(verify=verify_ssl, timeout=timeout)
         self._token: str | None = None
         self._token_at: float = 0.0
 
-    def login(self) -> str:
-        """Login and return session token."""
-        body = f"cmd=validate&user={USERNAME}&passwd={PASSWORD}\n\n"
-        resp = self._client.post(
-            NAXML_URL,
-            content=body.encode(),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        resp.raise_for_status()
-        token = self._extract_tag(resp.text, "cookie")
-        if not token:
-            raise ValueError(f"No token in response: {resp.text[:200]}")
-        self._token = token
-        self._token_at = time.time()
-        return token
-
-    def naxml(self, cmd: str, xml_body: str = "", **params) -> str:
-        """Send authenticated NAXML request with auto-relogin on expiry."""
-        for attempt in range(2):
-            if not self._token or (time.time() - self._token_at) > 82800:
-                self.login()
-            extra = "".join(f"&{k}={v}" for k, v in params.items())
-            body = f"cmd={cmd}&cookie={self._token}{extra}\n\n{xml_body}"
-            resp = self._client.post(
-                NAXML_URL,
+    async def login(self) -> bool:
+        body = f"cmd=validate&user={self.username}&passwd={self.password}\n\n"
+        try:
+            r = await self._http.post(
+                self.base_url + self.NAXML_PATH,
                 content=body.encode(),
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
-            resp.raise_for_status()
-            fault = self._extract_tag(resp.text, "faultCode")
-            if fault == "CGIPortal.LoginRequired" and attempt == 0:
+        except httpx.RequestError:
+            return False
+        if r.status_code != 200:
+            return False
+        token = self._extract(r.text, "cookie")
+        if not token:
+            return False
+        self._token = token
+        self._token_at = time.time()
+        return True
+
+    async def naxml(self, cmd: str, xml_body: str = "", **params) -> str:
+        for attempt in range(2):
+            if not self._token:
+                await self.login()
+            extra = "".join(f"&{k}={v}" for k, v in params.items())
+            body = f"cmd={cmd}&cookie={self._token}{extra}\n\n{xml_body}"
+            r = await self._http.post(
+                self.base_url + self.NAXML_PATH,
+                content=body.encode(),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+            r.raise_for_status()
+            fault = self._extract(r.text, "faultCode")
+            if fault == self.FAULT_LOGIN_REQUIRED and attempt == 0:
                 self._token = None
                 continue
             if fault:
                 raise RuntimeError(f"Commander fault: {fault}")
-            return resp.text
+            return r.text
         raise RuntimeError("Failed after relogin")
 
+    # Convenience methods
+    async def get_prices(self):    return await self.naxml("vfuelprices")
+    async def get_totals(self, p): return await self.naxml("vfueltotals", period=p)
+    async def get_pumps(self):     return await self.naxml("vmaintfprht")
+    async def get_config(self):    return await self.naxml("vfuelcfg")
+
     @staticmethod
-    def _extract_tag(text: str, tag: str) -> str | None:
-        m = re.search(fr"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
-        return m.group(1).strip() if m else None
-
-
-# Usage
-client = CommanderClient()
-client.login()
-
-# Read current prices
-prices_xml = client.naxml("vfuelprices")
-
-# Read day totals
-totals_xml = client.naxml("vfueltotals", period=2)
-
-# Read month totals
-month_xml = client.naxml("vfueltotals", period=3)
-
-# Read pump lifetime totals
-pumps_xml = client.naxml("vmaintfprht")
-
-# Write pending prices (does NOT push to pump)
-price_update_xml = """
-<fuel:fuelPrices xmlns:fuel="urn:vfi-sapphire:fuel.2001-10-01"
-                 xmlns:vs="urn:vfi-sapphire:vs.2001-10-01">
-  <vs:site>1</vs:site>
-  <fuelProducts>
-    <fuelProduct sysid="1" name="REGULAR">
-      <prices>
-        <price tier="2" servLevel="1" mop="1">5.199</price>
-        <price tier="2" servLevel="1" mop="2">5.299</price>
-        <price tier="2" servLevel="2" mop="1">5.199</price>
-        <price tier="2" servLevel="2" mop="2">5.299</price>
-        <price tier="2" servLevel="3" mop="1">5.199</price>
-        <price tier="2" servLevel="3" mop="2">5.299</price>
-      </prices>
-    </fuelProduct>
-  </fuelProducts>
-</fuel:fuelPrices>"""
-client.naxml("ufuelprices", xml_body=price_update_xml)
-
-# Push pending prices to dispensers (LIVE at pump after this)
-client.naxml("cfuelprices")
+    def _extract(text, tag):
+        s = text.find(f"<{tag}>")
+        e = text.find(f"</{tag}>", s)
+        return text[s+len(tag)+2:e].strip() if s != -1 and e != -1 else None
 ```
 
-### 11.2 cURL
+---
+
+## Implementation Notes
+
+### Startup Sequence
+
+1. Load config from env vars
+2. Attempt Commander login → store token
+3. Fetch initial prices → populate cache
+4. Start background tasks:
+   - **Price poll loop:** every `POLL_INTERVAL_SECONDS`, fetch `vfuelprices`, compare with cache, log any changes to SQLite, update cache
+   - **Session refresh loop:** every `SESSION_REFRESH_HOURS * 3600s`, proactively re-login
+5. Start serving API requests
+
+### Price Change Detection
+
+On every poll, compare freshly fetched prices against cached prices. If any grade's `in_effect.cash`, `in_effect.credit`, `pending.cash`, or `pending.credit` has changed, write a row to the SQLite `price_history` table. This gives consumers a change log without needing to subscribe to events.
+
+```sql
+CREATE TABLE IF NOT EXISTS price_history (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp    TEXT NOT NULL,
+    grade_id     INTEGER NOT NULL,
+    grade_name   TEXT NOT NULL,
+    tier         TEXT NOT NULL,   -- 'in_effect_cash', 'in_effect_credit', 'pending_cash', 'pending_credit'
+    old_price    REAL,
+    new_price    REAL NOT NULL,
+    detected_by  TEXT NOT NULL DEFAULT 'poll'
+);
+```
+
+### Graceful Degradation
+
+If the Commander is unreachable:
+- `/health` returns `connected: false` but HTTP 200
+- `/prices` returns the last cached prices with `stale: true` and `cache_age_seconds: N`
+- `/totals`, `/pumps`, `/config` return HTTP 502 with a clear error message
+- The background poll loop keeps retrying; when the Commander comes back, the cache updates automatically
+
+### Thread Safety
+
+Use a single `asyncio.Lock` around the session token update. All NAXML calls go through the same `CommanderClient` instance. FastAPI + uvicorn run on a single asyncio event loop, so `asyncio.Lock` is sufficient — no threading primitives needed.
+
+---
+
+## TLS Decoded Integration
+
+TLS Decoded is a POS transaction analysis tool that can be configured to pull data from HTTP endpoints. Once `commander-reader` is running, point TLS Decoded at:
+
+```
+http://<server-running-commander-reader>:8200/prices
+http://<server-running-commander-reader>:8200/totals?period=day
+```
+
+The response is plain JSON over plain HTTP — no auth, no NAXML, no SSL issues. TLS Decoded (or any similar tool) just polls these URLs on whatever interval it needs.
+
+**Recommended polling intervals for TLS Decoded:**
+- `/prices` — every 60s (matches poll loop; prices rarely change more than once/day)
+- `/totals?period=shift` — every 5 minutes (shift totals accumulate through the day)
+- `/health` — every 30s (connection monitoring)
+
+---
+
+## Stretch Goals / Ideas
+
+Once the base connector is working, here are extensions worth building:
+
+### Webhook / Push Notifications
+Add a `POST /webhooks` endpoint where consumers register a URL. When the poll loop detects a price change, POST to all registered URLs. Useful for alerting when prices change.
+
+```json
+// Webhook payload on price change
+{
+  "event": "price_changed",
+  "timestamp": "2026-08-10T14:00:00Z",
+  "grade_name": "REGULAR",
+  "tier": "in_effect_cash",
+  "old_price": 5.579,
+  "new_price": 5.199
+}
+```
+
+### Scheduled Price Snapshots
+Every N hours (configurable), snapshot current prices and totals to SQLite. Enables:
+- Historical price tracking over weeks/months
+- "What were prices last Tuesday at 6pm?" queries
+- CSV export of price history
+
+### Prometheus + Grafana
+`/metrics` endpoint in Prometheus exposition format. Pair with a `docker-compose.yml` that includes Prometheus + Grafana containers:
+
+```yaml
+services:
+  commander-reader:
+    # ... as above
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+```
+
+This gives you a full dashboard with price history graphs and pump total trends — for free.
+
+### Price Comparison / Competitor Tracking
+Add a background task that fetches nearby competitor prices from a gas price API (GasBuddy, AAA, etc.) and stores them alongside Commander prices. Expose via `/compare` endpoint. Useful for dynamic pricing decisions.
+
+### Monthly In-House Sales Report
+The user mentioned possibly adding monthly in-house sales data extraction. Once `vmaintfprht` (pump totals) and `vfueltotals` (period totals) are working, a monthly snapshot job can:
+1. On the 1st of each month, call `vfueltotals&period=4` (year) and `vfueltotals&period=3` (month)
+2. Store to SQLite with a `snapshot_date` field
+3. Expose via `GET /reports/monthly?year=2026&month=07` → JSON or CSV
+
+---
+
+## What NOT to Build (This Session)
+
+To keep scope clear:
+- **No write endpoints.** No `ufuelprices`, no `cfuelprices`, no car wash control.
+- **No React frontend.** The existing `commander-console` project has a UI. This is pure API.
+- **No external authentication.** This runs on an internal LAN. HTTP with no auth is fine. If auth is needed later, add an API key via a middleware in a future iteration.
+
+---
+
+## Delivery
+
+When done, the user should be able to:
 
 ```bash
-# Login
-curl -k -X POST "https://commander-host/cgi-bin/NAXML?" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data-binary $'cmd=validate&user=MANAGER&passwd=yourpassword\n\n'
+cd commander-reader
+cp .env.example .env
+# edit .env with real COMMANDER_HOST and COMMANDER_PASSWORD
+docker compose up -d
 
-# Read prices (replace TOKEN with value from <cookie> in login response)
-curl -k -X POST "https://commander-host/cgi-bin/NAXML?" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data-binary $'cmd=vfuelprices&cookie=TOKEN\n\n'
-
-# Day totals
-curl -k -X POST "https://commander-host/cgi-bin/NAXML?" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  --data-binary $'cmd=vfueltotals&cookie=TOKEN&period=2\n\n'
+# Verify
+curl http://localhost:8200/health
+curl http://localhost:8200/prices
+curl "http://localhost:8200/totals?period=day"
 ```
 
-> Note: `--data-binary` preserves the literal `\n\n`. Using `-d` or `--data` may strip or encode newlines.
+And see live Commander data as clean JSON with no NAXML knowledge required.
 
-### 11.3 Parsing Fuel Prices (Python / ElementTree)
-
-```python
-from xml.etree import ElementTree as ET
-
-NS = {
-    "fuel": "urn:vfi-sapphire:fuel.2001-10-01",
-    "vs":   "urn:vfi-sapphire:vs.2001-10-01",
-}
-
-def parse_prices(xml_str: str) -> list[dict]:
-    root = ET.fromstring(xml_str)
-    grades = []
-
-    products_el = root.find(".//fuelProducts")
-    if products_el is None:
-        # try namespace-qualified
-        for ns in NS.values():
-            products_el = root.find(f".//{{{ns}}}fuelProducts")
-            if products_el: break
-
-    for product in products_el or []:
-        name = product.get("name", "")
-        if not name or name.upper() == "UNUSED":
-            continue
-
-        grade = {"id": int(product.get("sysid")), "name": name, "prices": {}}
-
-        prices_el = product.find("prices")
-        for price_el in (prices_el or []):
-            tier = int(price_el.get("tier", 0))
-            serv = int(price_el.get("servLevel", 0))
-            mop  = int(price_el.get("mop", 0))
-            val  = float(price_el.text or 0)
-
-            if serv == 1:  # SELF service as canonical
-                key = ("cash" if mop == 1 else "credit")
-                prefix = "in_effect" if tier == 1 else "pending"
-                grade["prices"][f"{prefix}_{key}"] = val
-
-        grades.append(grade)
-
-    return sorted(grades, key=lambda g: g["id"])
-```
-
-### 11.4 Parsing Fuel Totals (Python)
-
-```python
-def parse_totals(xml_str: str) -> dict:
-    root = ET.fromstring(xml_str)
-    grade_map = {}
-
-    for fp in root.iter():
-        if not fp.tag.endswith("fpDispenserData"):
-            continue
-
-        name = vol = money = None
-        for child in fp:
-            local = child.tag.split("}")[-1]
-            if local == "productNumber":
-                name = child.get("name", "").strip()
-            elif local == "fuelVolume":
-                vol = float(child.text or 0)
-            elif local == "fuelMoney":
-                money = float(child.text or 0)
-
-        if name:
-            if name not in grade_map:
-                grade_map[name] = {"volume": 0.0, "money": 0.0}
-            grade_map[name]["volume"] += vol or 0
-            grade_map[name]["money"] += money or 0
-
-    return {
-        name: {
-            "volume_gallons": round(d["volume"], 3),
-            "revenue_usd":    round(d["money"], 2),
-            "avg_price":      round(d["money"] / d["volume"], 4) if d["volume"] else None,
-        }
-        for name, d in sorted(grade_map.items())
-    }
-```
+Swagger UI available at `http://localhost:8200/docs` for exploration.
 
 ---
 
-## 12. Security Notes
+## Suggested Build Order
 
-### 12.1 HTTPS with Self-Signed Certificate
-
-All Commander units use self-signed TLS certificates. Production integrations must either:
-- Disable certificate verification (simple, acceptable on private/air-gapped networks)
-- Extract the self-signed cert and pin it in your HTTP client
-
-### 12.2 Credentials in Transit
-
-Username and password are sent in the POST body in plaintext (form-encoded). They are protected by TLS in transit. Do not log request bodies.
-
-### 12.3 Session Token Security
-
-The session token is a 32-character hex string. It is functionally equivalent to a password for the duration of the session. Treat it accordingly:
-- Do not log it
-- Do not expose it through API responses or error messages
-- Store it only in memory (not on disk)
-
-### 12.4 Network Exposure
-
-The Commander's NAXML endpoint is typically exposed only on the local LAN or via DDNS to the owner's network. It should NOT be exposed to the public internet without additional authentication layers. The Commander has no built-in rate limiting or brute-force protection on the login endpoint.
-
-### 12.5 Write Operations are Immediately Dangerous
-
-`ufuelprices` + `cfuelprices` changes what customers pay at the pump, effective within seconds. Any integration with write access should:
-- Require explicit operator confirmation before calling `cfuelprices`
-- Log all write operations with timestamp and user identity
-- Implement sanity checks (e.g., reject prices outside a reasonable range)
-- Be accessible only from trusted network segments
+1. Copy `commander_client.py`, `naxml_parser.py`, `models.py`, `cache.py` from `commander-console/connector/` into `commander-reader/app/`
+2. Strip write methods from `commander_client.py`, add `get_pumps()` and `get_config()`
+3. Add `parse_pump_totals()` to `naxml_parser.py`
+4. Write new `main.py` (lifespan + background poll loop + session refresh) — simpler than commander-console's since no mock mode
+5. Write read-only routers one at a time: health → prices → totals → pumps → config → metrics
+6. Write `Dockerfile` and `docker-compose.yml`
+7. Add price change detection in the poll loop + SQLite write
+8. Test with `docker compose up`, hit `/docs`, verify all endpoints return real data
 
 ---
 
-## 13. Known Unknowns
-
-The following areas were identified but not fully explored:
-
-### 13.1 Carwash Control
-`ccarwashenable` and `ccarwashdisable` are in the funcList. The request format and any required XML body are unknown.
-
-### 13.2 Day/Shift Close
-Commands for closing shifts and days are present in the funcList. These are high-impact operations and were not probed.
-
-### 13.3 Write Format Verification
-The `ufuelprices` XML body format described in §8.2 was **inferred** from the `vfuelprices` read response structure. It was not captured directly from the GWT client making a real write. It is believed to be correct based on the symmetric read/write pattern, but subtle differences (attribute ordering, namespace declarations) may exist.
-
-### 13.4 Multiple Sites
-This reference covers a single-site Commander configuration (`<vs:site>1</vs:site>`). Multi-site Commander configurations may use different site IDs and require site selection in requests.
-
-### 13.5 Firmware Versioning
-The funcList content (365 commands) is from one specific firmware version. Older or newer Commander firmware may have different command sets, different XML schemas, or different authentication behavior.
-
-### 13.6 Real-Time Prices (`vfuelrtprices`)
-This command returns prices currently displayed on dispenser heads, which may differ from Commander DB prices when a push is in-flight. The exact XML schema was not captured; it likely mirrors `vfuelprices`.
-
-### 13.7 `vfuelcfg` Schema
-The fuel configuration response (`vfuelcfg`) was confirmed to return `<fuelcfg:fuelConfig>` XML with site parameters, UOM settings, and tier-2 scheduling, but the complete schema was not documented.
-
-### 13.8 Automatic Tier-2 Scheduling
-The Commander has a feature to automatically promote Tier 2 (Pending) prices to Tier 1 at a scheduled time (e.g., push new prices overnight). The configuration interface for this is in `vfuelcfg`/`ufuelcfg` but was not explored.
-
----
-
-## Acknowledgements
-
-Discovered through live reverse engineering of a production Verifone Commander unit. All findings are based on observed behavior of a real system and are provided for interoperability purposes under the principles of fair use for security research and system integration.
-
----
-
-*Last updated: August 2026. Commander firmware version: unknown (funcList contains 365 commands for MANAGER user).*
+*Handoff prepared: August 2026*
